@@ -2,14 +2,64 @@
 
 use egui_plot::{Bar, BarChart, Corner, Legend, Line, Plot, PlotPoint, PlotPoints, Text, VLine};
 use std::collections::HashMap;
+use std::sync::mpsc::{self, *};
 
 use eframe::egui::{self, Align2, Color32, RichText, Vec2};
 use eframe::egui::{Stroke, Ui};
+
+mod math;
+use math::*;
 
 const AC_MIN: u8 = 10;
 const AC_MAX: u8 = 24;
 
 fn main() -> eframe::Result {
+    // MaybeUninit this.
+    // Oh wait you cant move out of array.
+    let mut stats_senders = Vec::new();
+    let mut stats_receivers = Vec::new();
+    for _ in 0..2 {
+        let (enque_stats_tx, enque_stats_rx) = mpsc::channel();
+        let (stats_tx, stats_rx) = mpsc::channel();
+        // We mainly do this because calculating mean dmg for a range of possible ACs
+        // is terribly slow and we might as well offload all the math to a separate thread.
+        std::thread::spawn(move || {
+            loop {
+                match enque_stats_rx.recv() {
+                    Ok((build, ac, min_dmg)) => {
+                        let stats = calc_build_stats(&build, ac, min_dmg);
+                        stats_tx.send(stats).unwrap();
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        stats_senders.push(enque_stats_tx);
+        stats_receivers.push(stats_rx);
+    }
+
+    let mut means_senders = Vec::new();
+    let mut means_receivers = Vec::new();
+    for _ in 0..2 {
+        let (enque_means_tx, enque_means_rx) = mpsc::channel();
+        let (means_tx, means_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            loop {
+                match enque_means_rx.recv() {
+                    Ok(build) => {
+                        // This could have been faster if it didn't recompute everything
+                        // from scratch for no reason.
+                        let stats = calc_build_means(&build);
+                        means_tx.send(stats).unwrap();
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        means_senders.push(enque_means_tx);
+        means_receivers.push(means_rx);
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_maximized(true),
         ..Default::default()
@@ -21,55 +71,31 @@ fn main() -> eframe::Result {
             egui_extras::install_image_loaders(&cc.egui_ctx);
 
             Ok(Box::new(Dnd {
-                build_a: Build {
-                    attacks: vec![Attack {
-                        ab: 10,
-                        flat: 4,
-                        dice: [
-                            // (Die::D4, 2),
-                            (Die::D4, 40),
-                            // (Die::D6, 0),
-                            (Die::D6, 20),
-                            (Die::D8, 1),
-                            (Die::D10, 0),
-                            (Die::D20, 0),
-                        ],
-                    }],
-                    savage: false,
-                    crit_enabled: true,
-                    pmf: PMF::default(),
-                    cdf: CDF::default(),
-                    mean: 0.0,
-                    std_dev: 0.0,
-                    greater_then_chance: 0.0,
-                    min_dmg_chance: 0.0,
-                },
-                build_b: Build {
-                    attacks: vec![Attack {
-                        ab: 10,
-                        flat: 4,
-                        dice: [
-                            // (Die::D4, 2),
-                            (Die::D4, 40),
-                            // (Die::D6, 0),
-                            (Die::D6, 20),
-                            (Die::D8, 1),
-                            (Die::D10, 0),
-                            (Die::D20, 0),
-                        ],
-                    }],
-                    savage: false,
-                    crit_enabled: true,
-                    pmf: PMF::default(),
-                    cdf: CDF::default(),
-                    mean: 0.0,
-                    std_dev: 0.0,
-                    greater_then_chance: 0.0,
-                    min_dmg_chance: 0.0,
-                },
+                build_a: Build::default(),
+                build_b: Build::default(),
+
+                stats_a: Stats::default(),
+                stats_b: Stats::default(),
+
+                means_a: Vec::new(),
+                means_b: Vec::new(),
+
+                stats_rx_a: stats_receivers.pop().unwrap(),
+                stats_rx_b: stats_receivers.pop().unwrap(),
+
+                stats_tx_a: stats_senders.pop().unwrap(),
+                stats_tx_b: stats_senders.pop().unwrap(),
+
+                means_rx_a: means_receivers.pop().unwrap(),
+                means_rx_b: means_receivers.pop().unwrap(),
+
+                means_tx_a: means_senders.pop().unwrap(),
+                means_tx_b: means_senders.pop().unwrap(),
+
                 sim_ac: 18,
                 desired_min_dmg: 15,
-                state_changed: true,
+                changed_a: true,
+                changed_b: true,
             }))
         }),
     )
@@ -91,21 +117,11 @@ struct Attack {
     dice: [(Die, u8); 5],
 }
 
-impl Attack {
-    fn dmg(&self) -> f64 {
-        let mut total = self.flat;
-        for die in self.dice {
-            total += (die.0 as u8 / 2) * die.1;
-        }
-        total as f64
-    }
-}
-
 impl Default for Attack {
     fn default() -> Self {
         Self {
             ab: 10,
-            flat: 5,
+            flat: 4,
             dice: [
                 (Die::D4, 2),
                 (Die::D6, 0),
@@ -117,74 +133,83 @@ impl Default for Attack {
     }
 }
 
-struct Dnd {
-    build_a: Build,
-    build_b: Build,
-    sim_ac: u8,
-    desired_min_dmg: u32,
-    state_changed: bool,
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Build {
     attacks: Vec<Attack>,
     savage: bool,
     crit_enabled: bool,
-    pmf: PMF,
-    cdf: CDF,
-    mean: f64,
-    std_dev: f64,
-    greater_then_chance: f64,
-    min_dmg_chance: f64,
+}
+
+impl Default for Build {
+    fn default() -> Self {
+        Self {
+            attacks: vec![Attack::default()],
+            savage: false,
+            crit_enabled: true,
+        }
+    }
+}
+
+struct Dnd {
+    build_a: Build,
+    build_b: Build,
+    stats_a: Stats,
+    stats_b: Stats,
+    // We store these outside of core stats because it takes much longer to compute and we dont
+    // want to stall the other data.
+    means_a: Vec<f64>,
+    means_b: Vec<f64>,
+
+    stats_rx_a: Receiver<Stats>,
+    stats_rx_b: Receiver<Stats>,
+
+    stats_tx_a: Sender<(Build, u8, u32)>,
+    stats_tx_b: Sender<(Build, u8, u32)>,
+
+    means_rx_a: Receiver<Vec<f64>>,
+    means_rx_b: Receiver<Vec<f64>>,
+
+    means_tx_a: Sender<Build>,
+    means_tx_b: Sender<Build>,
+
+    sim_ac: u8,
+    desired_min_dmg: u32,
+    changed_a: bool,
+    changed_b: bool,
 }
 
 impl eframe::App for Dnd {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.state_changed {
-            self.state_changed = false;
+        if self.changed_a {
+            self.changed_a = false;
+            self.stats_tx_a
+                .send((self.build_a.clone(), self.sim_ac, self.desired_min_dmg))
+                .unwrap();
+            self.means_tx_a.send(self.build_a.clone()).unwrap();
+        }
 
-            self.build_a.pmf = convolve_many(
-                &self
-                    .build_a
-                    .attacks
-                    .iter()
-                    .map(|a| {
-                        attack_pmf(
-                            a,
-                            self.sim_ac,
-                            self.build_a.crit_enabled,
-                            self.build_a.savage,
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            self.build_a.cdf = cdf(&self.build_a.pmf);
-            self.build_a.mean = mean(&self.build_a.pmf);
-            self.build_a.std_dev = std_dev(&self.build_a.pmf);
-            self.build_a.min_dmg_chance = chance_at_least(&self.build_a.pmf, self.desired_min_dmg);
+        if self.changed_b {
+            self.changed_b = false;
+            self.stats_tx_b
+                .send((self.build_b.clone(), self.sim_ac, self.desired_min_dmg))
+                .unwrap();
+            self.means_tx_b.send(self.build_b.clone()).unwrap();
+        }
 
-            self.build_b.pmf = convolve_many(
-                &self
-                    .build_b
-                    .attacks
-                    .iter()
-                    .map(|a| {
-                        attack_pmf(
-                            a,
-                            self.sim_ac,
-                            self.build_b.crit_enabled,
-                            self.build_b.savage,
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            self.build_b.cdf = cdf(&self.build_b.pmf);
-            self.build_b.mean = mean(&self.build_b.pmf);
-            self.build_b.std_dev = std_dev(&self.build_b.pmf);
-            self.build_b.min_dmg_chance = chance_at_least(&self.build_b.pmf, self.desired_min_dmg);
+        if let Ok(stats) = self.stats_rx_a.try_recv() {
+            self.stats_a = stats;
+        }
 
-            self.build_a.greater_then_chance = greater_than(&self.build_a.pmf, &self.build_b.pmf);
-            self.build_b.greater_then_chance = greater_than(&self.build_b.pmf, &self.build_a.pmf);
+        if let Ok(stats) = self.stats_rx_b.try_recv() {
+            self.stats_b = stats;
+        }
+
+        if let Ok(means) = self.means_rx_a.try_recv() {
+            self.means_a = means;
+        }
+
+        if let Ok(means) = self.means_rx_b.try_recv() {
+            self.means_b = means;
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -202,16 +227,18 @@ impl eframe::App for Dnd {
                         item_width,
                         "Build A",
                         &mut self.build_a,
+                        &self.stats_a,
                         self.desired_min_dmg,
-                        &mut self.state_changed,
+                        &mut self.changed_a,
                     );
                     build_box(
                         ui,
                         item_width,
                         "Build B",
                         &mut self.build_b,
+                        &self.stats_b,
                         self.desired_min_dmg,
-                        &mut self.state_changed,
+                        &mut self.changed_b,
                     );
                 });
 
@@ -224,13 +251,17 @@ impl eframe::App for Dnd {
 
                     ui.horizontal(|ui| {
                         ui.label("Sim AC:");
-                        self.state_changed |=
-                            ui.add(egui::DragValue::new(&mut self.sim_ac)).changed();
+                        let changed = ui.add(egui::DragValue::new(&mut self.sim_ac)).changed();
+                        self.changed_a |= changed;
+                        self.changed_b |= changed;
+
                         ui.add_space(10.0);
                         ui.label("Min desired dmg:");
-                        self.state_changed |= ui
+                        let changed = ui
                             .add(egui::DragValue::new(&mut self.desired_min_dmg))
                             .changed();
+                        self.changed_a |= changed;
+                        self.changed_b |= changed;
                     });
                 });
                 ui.add_space(20.0);
@@ -239,8 +270,8 @@ impl eframe::App for Dnd {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = gap;
                     let plot_size = Vec2::new(plot_width, 500.0);
-                    plot_pmf(ui, "Damage Distribution A", &self.build_a.pmf, plot_size);
-                    plot_pmf(ui, "Damage Distribution B", &self.build_b.pmf, plot_size);
+                    plot_pmf(ui, "Damage Distribution A", &self.stats_a.pmf, plot_size);
+                    plot_pmf(ui, "Damage Distribution B", &self.stats_b.pmf, plot_size);
                 });
 
                 ui.add_space(15.0);
@@ -250,13 +281,13 @@ impl eframe::App for Dnd {
                     plot_cdf(
                         ui,
                         "Cumulative Distribution A",
-                        &self.build_a.cdf,
+                        &self.stats_a.cdf,
                         plot_size,
                     );
                     plot_cdf(
                         ui,
                         "Cumulative Distrbuition B",
-                        &self.build_b.cdf,
+                        &self.stats_b.cdf,
                         plot_size,
                     );
                 });
@@ -264,8 +295,18 @@ impl eframe::App for Dnd {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = gap;
                     let plot_size = Vec2::new(plot_width, 500.0);
-                    plot_mean_for_ac(ui, "Mean DMG per AC for Build A", plot_size, &self.build_a);
-                    plot_mean_for_ac(ui, "Mean DMG per AC for Build B", plot_size, &self.build_b);
+                    plot_mean_for_ac(
+                        ui,
+                        "Mean DMG for given AC for Build A",
+                        plot_size,
+                        &self.means_a,
+                    );
+                    plot_mean_for_ac(
+                        ui,
+                        "Mean DMG for given AC for Build B",
+                        plot_size,
+                        &self.means_b,
+                    );
                 });
 
                 ui.separator();
@@ -274,179 +315,12 @@ impl eframe::App for Dnd {
     }
 }
 
-type PMF = HashMap<u32, f64>;
-type CDF = Vec<(u32, f64)>;
-
-fn hit_chance(ab: i32, ac: i32) -> f64 {
-    let needed_roll = (ac - ab).clamp(2, 20);
-
-    let possible_hits = 21 - needed_roll;
-    let mut chance = possible_hits as f64 / 20.0;
-
-    if ab + 1 >= ac {
-        chance -= 1.0 / 20.0;
-    }
-    if ab + 20 < ac {
-        chance += 1.0 / 20.0;
-    }
-
-    chance.clamp(0.0, 1.0)
-}
-
-fn convolve(a: &PMF, b: &PMF) -> PMF {
-    let mut result = HashMap::new();
-    for (&x, &px) in a {
-        for (&y, &py) in b {
-            *result.entry(x + y).or_insert(0.0) += px * py;
-        }
-    }
-    result
-}
-
-fn convolve_many(pmfs: &[PMF]) -> PMF {
-    pmfs.iter()
-        .cloned()
-        .reduce(|a, b| convolve(&a, &b))
-        .unwrap_or_default()
-}
-
-fn scale(pmf: &PMF, factor: f64) -> PMF {
-    pmf.iter().map(|(&k, &v)| (k, v * factor)).collect()
-}
-
-fn shift(pmf: &PMF, offset: u32) -> PMF {
-    pmf.iter().map(|(&k, &v)| (k + offset, v)).collect()
-}
-
-fn die_pmf(die: Die) -> PMF {
-    let mut pmf = HashMap::new();
-    let sides = die as u32;
-    for i in 1..=sides {
-        pmf.insert(i, 1.0 / sides as f64);
-    }
-    pmf
-}
-
-fn attack_pmf(attack: &Attack, ac: u8, crit_enabled: bool, savage_attacker: bool) -> PMF {
-    let base_pmfs: Vec<_> = attack
-        .dice
-        .iter()
-        .flat_map(|&(die, count)| {
-            let single = die_pmf(die);
-            std::iter::repeat(single).take(count as usize)
-        })
-        .collect();
-
-    let base_dmg_dist = convolve_many(&base_pmfs);
-    let base_pmf = shift(&base_dmg_dist, attack.flat as u32);
-
-    let base_pmf = if savage_attacker {
-        best_of_two(&base_pmf)
-    } else {
-        base_pmf
-    };
-
-    let crit_pmfs: Vec<_> = attack
-        .dice
-        .iter()
-        .flat_map(|&(die, count)| {
-            let single = die_pmf(die);
-            std::iter::repeat(single).take((2 * count) as usize)
-        })
-        .collect();
-
-    let crit_dmg_dist = convolve_many(&crit_pmfs);
-    let crit_pmf = shift(&crit_dmg_dist, attack.flat as u32);
-
-    let crit_pmf = if savage_attacker {
-        best_of_two(&crit_pmf)
-    } else {
-        crit_pmf
-    };
-
-    let hit_chance = hit_chance(attack.ab, ac as _);
-    let crit_chance = if crit_enabled { 1.0 / 20.0 } else { 0.0 };
-
-    let split_hit_chance = hit_chance - crit_chance;
-    let mut pmf = scale(&base_pmf, split_hit_chance);
-    let crit_pmf = scale(&crit_pmf, crit_chance);
-
-    for (k, v) in crit_pmf {
-        *pmf.entry(k).or_default() += v;
-    }
-
-    *pmf.entry(0).or_insert(0.0) += 1.0 - hit_chance; // 0 dmg on miss.
-    pmf
-}
-
-fn best_of_two(pmf: &PMF) -> PMF {
-    let mut result = PMF::new();
-    for (&x, &px) in pmf {
-        for (&y, &py) in pmf {
-            let max = x.max(y);
-            *result.entry(max).or_default() += px * py;
-        }
-    }
-    result
-}
-
-fn mean(pmf: &PMF) -> f64 {
-    pmf.iter().map(|(&val, &prob)| val as f64 * prob).sum()
-}
-
-fn variance(pmf: &PMF) -> f64 {
-    let mean = mean(pmf);
-    pmf.iter()
-        .map(|(&val, &prob)| {
-            let diff = val as f64 - mean;
-            diff * diff * prob
-        })
-        .sum()
-}
-
-fn std_dev(pmf: &PMF) -> f64 {
-    variance(pmf).sqrt()
-}
-
-fn greater_than(a: &PMF, b: &PMF) -> f64 {
-    let mut prob = 0.0;
-    for (&a_val, &a_prob) in a {
-        for (&b_val, &b_prob) in b {
-            if a_val > b_val {
-                prob += a_prob * b_prob;
-            }
-        }
-    }
-    prob
-}
-
-fn chance_at_least(pmf: &PMF, threshold: u32) -> f64 {
-    pmf.iter()
-        .filter(|&(&val, _)| val >= threshold)
-        .map(|(_, &prob)| prob)
-        .sum()
-}
-
-fn cdf(pmf: &PMF) -> Vec<(u32, f64)> {
-    let mut cumulative = 0.0;
-    let mut result = Vec::new();
-
-    let mut values: Vec<_> = pmf.iter().collect();
-    values.sort_by_key(|&(&val, _)| val);
-
-    for (&val, &prob) in values {
-        cumulative += prob;
-        result.push((val, cumulative));
-    }
-
-    result
-}
-
 fn build_box(
     ui: &mut Ui,
     item_width: f32,
     build_name: &str,
     build: &mut Build,
+    stats: &Stats,
     desired_min_dmg: u32,
     changed: &mut bool,
 ) {
@@ -463,6 +337,7 @@ fn build_box(
             if ui.button("Add attack").clicked() {
                 let prev_or_def = build.attacks.last().cloned().unwrap_or(Attack::default());
                 build.attacks.push(prev_or_def);
+                *changed = true;
             }
             let mut remove_request = None;
             for (i, attack) in build.attacks.iter_mut().enumerate() {
@@ -512,18 +387,18 @@ fn build_box(
                 .changed();
             *changed |= ui.checkbox(&mut build.savage, "Savage Attacker").changed();
             ui.add_space(10.0);
-            ui.label(RichText::new(format!("Mean damage: {:.2}", build.mean)).size(15.0));
-            ui.label(RichText::new(format!("Standard deviation: {:.2}", build.std_dev)).size(15.0));
+            ui.label(RichText::new(format!("Mean damage: {:.2}", stats.mean)).size(15.0));
+            ui.label(RichText::new(format!("Standard deviation: {:.2}", stats.std_dev)).size(15.0));
             ui.add_space(10.0);
             ui.label(format!(
                 "There is {:.1}% chance that {} will out damage the other build.",
-                build.greater_then_chance * 100.0,
+                stats.greater_then_chance * 100.0,
                 build_name
             ));
 
             ui.label(RichText::new(format!(
                 "There is {:.1}% chance to deal at least {} damage.",
-                build.min_dmg_chance * 100.0,
+                stats.min_dmg_chance * 100.0,
                 desired_min_dmg,
             )));
         });
@@ -641,18 +516,13 @@ fn plot_cdf(ui: &mut Ui, title: &str, cdf: &CDF, size: Vec2) {
     });
 }
 
-fn plot_mean_for_ac(ui: &mut Ui, title: &str, size: Vec2, build: &Build) {
-    let bars: Vec<Bar> = (10..24)
-        .map(|ac| {
-            let pmf = convolve_many(
-                &build
-                    .attacks
-                    .iter()
-                    .map(|a| attack_pmf(a, ac, build.crit_enabled, build.savage))
-                    .collect::<Vec<_>>(),
-            );
-            let mean = mean(&pmf);
-            Bar::new(ac as f64, mean)
+fn plot_mean_for_ac(ui: &mut Ui, title: &str, size: Vec2, means: &Vec<f64>) {
+    let bars: Vec<Bar> = means
+        .iter()
+        .enumerate()
+        .map(|(offset, mean)| {
+            let ac = AC_MIN + offset as u8;
+            Bar::new(ac as f64, *mean)
                 .fill(Color32::from_rgb(70, 53, 177))
                 .stroke(Stroke::new(0.2, Color32::BLACK))
         })
@@ -664,8 +534,8 @@ fn plot_mean_for_ac(ui: &mut Ui, title: &str, size: Vec2, build: &Build) {
             ui.label(RichText::new(title).size(20.0).strong());
             Plot::new(title)
                 .view_aspect(2.0)
-                .x_axis_label("dmg")
-                .y_axis_label("chance")
+                .x_axis_label("AC")
+                .y_axis_label("dmg")
                 .allow_scroll(false)
                 .allow_boxed_zoom(false)
                 .allow_drag(false)
