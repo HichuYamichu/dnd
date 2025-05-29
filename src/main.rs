@@ -206,9 +206,11 @@ impl eframe::App for Dnd {
 
         if let Ok(means) = self.means_rx_a.try_recv() {
             self.means_a = means;
+            self.stats_a.greater_then_chance = greater_than(&self.stats_a.pmf, &self.stats_b.pmf);
         }
 
         if let Ok(means) = self.means_rx_b.try_recv() {
+            self.stats_b.greater_then_chance = greater_than(&self.stats_b.pmf, &self.stats_a.pmf);
             self.means_b = means;
         }
 
@@ -381,6 +383,7 @@ fn build_box(
             }
             if let Some(idx) = remove_request {
                 build.attacks.remove(idx);
+                *changed = true;
             }
             *changed |= ui
                 .checkbox(&mut build.crit_enabled, "Crits Enabled")

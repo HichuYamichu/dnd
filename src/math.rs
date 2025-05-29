@@ -150,7 +150,7 @@ fn std_dev(pmf: &PMF) -> f64 {
     variance(pmf).sqrt()
 }
 
-fn greater_than(a: &PMF, b: &PMF) -> f64 {
+pub fn greater_than(a: &PMF, b: &PMF) -> f64 {
     let mut prob = 0.0;
     for (&a_val, &a_prob) in a {
         for (&b_val, &b_prob) in b {
